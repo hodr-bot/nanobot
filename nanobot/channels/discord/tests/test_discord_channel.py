@@ -118,6 +118,9 @@ class _FakeChannel:
         self.sent_messages: list[_FakeSentMessage] = []
         self.trigger_typing_calls = 0
         self.typing_enter_hook = None
+        self.past_messages: list = []
+        self.fetch_targets: dict = {}
+        self.history_calls: list[dict] = []
 
     async def send(self, **kwargs) -> None:
         payload = dict(kwargs)
@@ -131,6 +134,20 @@ class _FakeChannel:
 
     def get_partial_message(self, message_id: int) -> _FakePartialMessage:
         return _FakePartialMessage(message_id, self.id)
+
+    async def history(self, *, limit: int = 100, before=None, oldest_first: bool = False):
+        self.history_calls.append({"limit": limit, "before": before, "oldest_first": oldest_first})
+        items = list(self.past_messages)
+        if before is not None:
+            items = [m for m in items if m.id < before.id]
+        items = items[-limit:]
+        if not oldest_first:
+            items = items[::-1]
+        for item in items:
+            yield item
+
+    async def fetch_message(self, message_id: int):
+        return self.fetch_targets[message_id]
 
     def typing(self):
         channel = self
@@ -1853,3 +1870,119 @@ async def test_reset_discards_in_flight_compaction_notices() -> None:
     await owner._reset_runtime_state()
 
     assert owner._compaction_notices == {}
+
+
+def _make_past_message(*, message_id: int, author_name: str, content: str):
+    return SimpleNamespace(
+        id=message_id,
+        author=SimpleNamespace(display_name=author_name),
+        content=content,
+        attachments=[],
+    )
+
+
+def _make_backfill_channel(**overrides) -> DiscordChannel:
+    config = dict(enabled=True, allow_from=["*"], group_policy="open")
+    config.update(overrides)
+    channel = DiscordChannel(DiscordConfig(**config), MessageBus())
+    handled: list[dict] = []
+
+    async def capture_handle(**kwargs) -> None:
+        handled.append(kwargs)
+
+    channel._handle_message = capture_handle  # type: ignore[method-assign]
+    channel.captured = handled  # type: ignore[attr-defined]
+    return channel
+
+
+@pytest.mark.asyncio
+async def test_backfill_thread_history_on_first_message() -> None:
+    channel = _make_backfill_channel()
+    message = _make_message(author_id=123, channel_id=200, parent_channel_id=100, guild_id=1)
+    message.channel.past_messages = [
+        _make_past_message(message_id=1, author_name="alice", content="first point"),
+        _make_past_message(message_id=2, author_name="bob", content="second point"),
+    ]
+
+    await channel._on_message(message)
+
+    assert len(channel.captured) == 1
+    content = channel.captured[0]["content"]
+    assert content.startswith("<recent thread context>\n")
+    assert "alice: first point" in content
+    assert "bob: second point" in content
+    assert content.endswith("</recent thread context>\n\nhello")
+    assert message.channel.history_calls, "history should have been fetched"
+
+
+@pytest.mark.asyncio
+async def test_backfill_only_once_per_session() -> None:
+    channel = _make_backfill_channel()
+    first = _make_message(author_id=123, channel_id=200, parent_channel_id=100, guild_id=1)
+    first.channel.past_messages = [
+        _make_past_message(message_id=1, author_name="alice", content="context"),
+    ]
+    await channel._on_message(first)
+
+    second = _make_message(
+        author_id=123, channel_id=200, parent_channel_id=100, guild_id=1, message_id=790,
+    )
+    second.channel.past_messages = first.channel.past_messages
+    await channel._on_message(second)
+
+    assert len(channel.captured) == 2
+    assert "<recent thread context>" in channel.captured[0]["content"]
+    assert "<recent thread context>" not in channel.captured[1]["content"]
+    assert channel.captured[1]["content"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_backfill_disabled_at_zero_limit() -> None:
+    channel = _make_backfill_channel(history_limit=0)
+    message = _make_message(author_id=123, channel_id=200, parent_channel_id=100, guild_id=1)
+    message.channel.past_messages = [
+        _make_past_message(message_id=1, author_name="alice", content="context"),
+    ]
+
+    await channel._on_message(message)
+
+    assert len(channel.captured) == 1
+    assert channel.captured[0]["content"] == "hello"
+    assert message.channel.history_calls == []
+
+
+@pytest.mark.asyncio
+async def test_backfill_resolves_reply_target_outside_window() -> None:
+    channel = _make_backfill_channel(history_limit=1)
+    message = _make_message(
+        author_id=123, channel_id=200, parent_channel_id=100, guild_id=1, reply_to=99,
+    )
+    message.channel.past_messages = [
+        _make_past_message(message_id=2, author_name="bob", content="recent"),
+    ]
+    message.channel.fetch_targets = {
+        99: _make_past_message(message_id=99, author_name="alice", content="original question"),
+    }
+
+    await channel._on_message(message)
+
+    content = channel.captured[0]["content"]
+    assert "[replying to] alice: original question" in content
+    assert "bob: recent" in content
+
+
+@pytest.mark.asyncio
+async def test_backfill_failure_is_best_effort() -> None:
+    channel = _make_backfill_channel()
+
+    async def fail_history(**kwargs):
+        raise RuntimeError("discord down")
+        yield  # pragma: no cover - never reached
+
+    message = _make_message(author_id=123, channel_id=200, parent_channel_id=100, guild_id=1)
+    message.channel.history = fail_history  # type: ignore[method-assign]
+
+    await channel._on_message(message)
+
+    assert len(channel.captured) == 1
+    assert channel.captured[0]["content"] == "hello"

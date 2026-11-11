@@ -38,6 +38,8 @@ if DISCORD_AVAILABLE:
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
 MAX_MESSAGE_LEN = 2000  # Discord message character limit
 TYPING_INTERVAL_S = 8
+HISTORY_BACKFILL_MAX_CHARS = 12000
+HISTORY_BACKFILL_PER_MESSAGE_CHARS = 1000
 
 
 @dataclass
@@ -64,6 +66,7 @@ class DiscordConfig(Base):
     working_emoji_delay: float = 2.0
     streaming: bool = True
     reply_to_message: bool = False
+    history_limit: int = 20
     use_proxy: bool = False
 
 
@@ -183,6 +186,13 @@ if DISCORD_AVAILABLE:
                     metadata["context_chat_id"] = parent_channel_id
                     metadata["thread_id"] = str(channel_id)
                     session_key = f"{self._channel.name}:{parent_channel_id}:thread:{channel_id}"
+
+            backfill_key = session_key or f"{self._channel.name}:{channel_id}"
+            context_block = await self._channel._maybe_backfill_history(
+                channel, backfill_key=backfill_key,
+            )
+            if context_block:
+                command_text = f"{context_block}\n\n{command_text}"
 
             await self._channel._handle_message(
                 sender_id=sender_id,
@@ -454,6 +464,7 @@ class DiscordChannel(BaseChannel):
         self._inbound_tasks: set[asyncio.Task[Any]] = set()
         self._stream_bufs: dict[str, _StreamBuf] = {}
         self._known_channels: dict[str, Any] = {}
+        self._history_backfilled: set[str] = set()
 
     def _remember_channel(self, channel: Any) -> None:
         self._known_channels[self._channel_key(channel)] = channel
@@ -618,6 +629,85 @@ class DiscordChannel(BaseChannel):
             if task is not None:
                 self._inbound_tasks.discard(task)
 
+    @staticmethod
+    def _format_backfill_line(message: Any) -> str | None:
+        """Render one Discord message as a single context line, or None to skip."""
+        text = (getattr(message, "content", "") or "").strip()
+        attachments = getattr(message, "attachments", None) or []
+        if not text and not attachments:
+            return None
+        if len(text) > HISTORY_BACKFILL_PER_MESSAGE_CHARS:
+            text = text[:HISTORY_BACKFILL_PER_MESSAGE_CHARS] + "…"
+        author = getattr(getattr(message, "author", None), "display_name", None) or "unknown"
+        if attachments:
+            text = (text + " " if text else "") + f"[{len(attachments)} attachment(s)]"
+        return f"{author}: {text}" if text else f"{author}: [no text]"
+
+    async def _fetch_thread_context(
+        self,
+        channel: Any,
+        *,
+        before: Any | None = None,
+        reply_to_id: int | None = None,
+    ) -> str:
+        """Fetch recent thread history as a context block for a fresh session.
+
+        Returns an empty string when backfill is disabled (history_limit <= 0),
+        when there is nothing to show, or when the fetch fails. Never raises:
+        history is best-effort context, not a delivery dependency.
+        """
+        try:
+            limit = int(self.config.history_limit or 0)
+        except (TypeError, ValueError):
+            return ""
+        if limit <= 0:
+            return ""
+        lines: list[str] = []
+        seen_ids: set[int] = set()
+        try:
+            history = channel.history(limit=limit + 1, before=before, oldest_first=True)
+            async for past in history:
+                if getattr(past, "id", None) is None:
+                    continue
+                seen_ids.add(past.id)
+                line = self._format_backfill_line(past)
+                if line is not None:
+                    lines.append(line)
+            if reply_to_id is not None and reply_to_id not in seen_ids:
+                try:
+                    target = await channel.fetch_message(reply_to_id)
+                except Exception as e:
+                    self.logger.debug("backfill reply target {} unavailable: {}", reply_to_id, e)
+                    target = None
+                if target is not None:
+                    line = self._format_backfill_line(target)
+                    if line is not None:
+                        lines.insert(0, f"[replying to] {line}")
+        except Exception as e:
+            self.logger.debug("thread history backfill failed: {}", e)
+            return ""
+        while lines and sum(len(line) for line in lines) > HISTORY_BACKFILL_MAX_CHARS:
+            lines.pop(0)
+        if not lines:
+            return ""
+        return "<recent thread context>\n" + "\n".join(lines) + "\n</recent thread context>"
+
+    async def _maybe_backfill_history(
+        self,
+        channel: Any,
+        *,
+        backfill_key: str,
+        before: Any | None = None,
+        reply_to_id: int | None = None,
+    ) -> str:
+        """Fetch thread context once per session key per gateway run."""
+        if backfill_key in self._history_backfilled:
+            return ""
+        self._history_backfilled.add(backfill_key)
+        return await self._fetch_thread_context(
+            channel, before=before, reply_to_id=reply_to_id,
+        )
+
     async def _process_discord_message(self, message: discord.Message) -> None:
         """Handle incoming Discord messages from discord.py.
 
@@ -650,6 +740,20 @@ class DiscordChannel(BaseChannel):
             metadata["context_chat_id"] = parent_channel_id
             metadata["thread_id"] = channel_id
             session_key = f"{self.name}:{parent_channel_id}:thread:{channel_id}"
+
+        backfill_key = session_key or f"{self.name}:{channel_id}"
+        context_block = await self._maybe_backfill_history(
+            message.channel,
+            backfill_key=backfill_key,
+            before=message,
+            reply_to_id=(
+                message.reference.message_id
+                if message.reference and message.reference.message_id
+                else None
+            ),
+        )
+        if context_block:
+            full_content = f"{context_block}\n\n{full_content}"
 
         await self._start_typing(message.channel)
 
