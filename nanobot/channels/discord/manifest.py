@@ -17,6 +17,7 @@ SETUP_SPEC = ChannelSetupSpec(
         "streaming": field("bool", default=True),
         "replyToMessage": field("bool", default=False),
         "historyLimit": field("int", default=20),
+        "statusText": field("string", default=""),
     },
     required=(required("token"),),
     official_url="https://discord.com/developers/applications",

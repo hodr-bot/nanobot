@@ -1986,3 +1986,15 @@ async def test_backfill_failure_is_best_effort() -> None:
 
     assert len(channel.captured) == 1
     assert channel.captured[0]["content"] == "hello"
+
+
+def test_presence_activity_unconfigured_returns_none() -> None:
+    channel = _make_backfill_channel()
+    assert channel._presence_activity() is None
+
+
+def test_presence_activity_builds_game() -> None:
+    channel = _make_backfill_channel(status_text="veille sur le serveur")
+    activity = channel._presence_activity()
+    assert activity is not None
+    assert activity.name == "veille sur le serveur"

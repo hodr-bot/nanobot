@@ -67,6 +67,7 @@ class DiscordConfig(Base):
     streaming: bool = True
     reply_to_message: bool = False
     history_limit: int = 20
+    status_text: str = ""
     use_proxy: bool = False
 
 
@@ -96,6 +97,12 @@ if DISCORD_AVAILABLE:
                 self._channel.logger.info("app commands synced: {}", len(synced))
             except Exception as e:
                 self._channel.logger.warning("app command sync failed: {}", e)
+            activity = self._channel._presence_activity()
+            if activity is not None:
+                try:
+                    await self.change_presence(activity=activity)
+                except Exception as e:
+                    self._channel.logger.warning("presence update failed: {}", e)
 
         async def on_message(self, message: discord.Message) -> None:
             if self._channel._client is not self or not self._channel.is_running:
@@ -628,6 +635,13 @@ class DiscordChannel(BaseChannel):
         finally:
             if task is not None:
                 self._inbound_tasks.discard(task)
+
+    def _presence_activity(self) -> Any | None:
+        """Build the startup presence activity, or None when unconfigured."""
+        text = (self.config.status_text or "").strip()
+        if not text or not DISCORD_AVAILABLE:
+            return None
+        return discord.Game(name=text)
 
     @staticmethod
     def _format_backfill_line(message: Any) -> str | None:
